@@ -8,12 +8,13 @@ import qualified RIO.Text as Text
 import qualified Docker
 import qualified Data.Time.Clock.POSIX as Time
 import qualified Data.Aeson as Aeson
+import qualified Codec.Serialise as Serialise
 
 newtype Pipeline
   = Pipeline
       { steps :: NonEmpty Step
       }
-  deriving (Eq, Show, Generic, Aeson.FromJSON)
+  deriving (Eq, Show, Generic, Aeson.FromJSON, Serialise.Serialise)
 
 data Step
   = Step
@@ -21,7 +22,7 @@ data Step
       , commands :: NonEmpty Text
       , image :: Docker.Image
       }
-  deriving (Eq, Show, Generic, Aeson.FromJSON)
+  deriving (Eq, Show, Generic, Aeson.FromJSON, Serialise.Serialise)
 
 data Build
   = Build
@@ -30,12 +31,12 @@ data Build
       , completedSteps :: Map StepName StepResult
       , volume :: Docker.Volume
       }
-  deriving (Eq, Show)
+  deriving (Eq, Show, Generic, Serialise.Serialise)
 
 data StepResult
   = StepFailed Docker.ContainerExitCode
   | StepSucceeded
-  deriving (Eq, Show)
+  deriving (Eq, Show, Generic, Serialise.Serialise)
 
 exitCodeToStepResult :: Docker.ContainerExitCode -> StepResult
 exitCodeToStepResult exit
@@ -46,22 +47,23 @@ data BuildState
   = BuildReady
   | BuildRunning BuildRunningState
   | BuildFinished BuildResult
-  deriving (Eq, Show)
+  deriving (Eq, Show, Generic, Serialise.Serialise)
 
 data BuildRunningState
   = BuildRunningState
       { step :: StepName
       , container :: Docker.ContainerId
       }
-  deriving (Eq, Show)
+  deriving (Eq, Show, Generic, Serialise.Serialise)
+
 data BuildResult
   = BuildSucceeded
   | BuildFailed
   | BuildUnexpectedState Text
-  deriving (Eq, Show)
+  deriving (Eq, Show, Generic, Serialise.Serialise)
 
 newtype StepName = StepName Text
-  deriving (Eq, Show, Ord, Generic, Aeson.FromJSON)
+  deriving (Eq, Show, Ord, Generic, Aeson.FromJSON, Serialise.Serialise)
 
 stepNameToText :: StepName -> Text
 stepNameToText (StepName step) = step
@@ -85,6 +87,12 @@ data CollectionStatus
   | CollectingLogs Docker.ContainerId Time.POSIXTime
   | CollectionFinished
   deriving (Eq, Show)
+
+newtype BuildNumber = BuildNumber Int
+  deriving (Eq, Show, Ord, Generic, Serialise.Serialise)
+
+buildNumberToInt :: BuildNumber -> Int
+buildNumberToInt (BuildNumber n) = n
 
 progress :: Docker.Service -> Build -> IO Build
 progress docker build =
@@ -135,7 +143,7 @@ data Log = Log
   { output :: ByteString
   , step :: StepName
   }
-  deriving (Eq, Show)
+  deriving (Eq, Show, Generic, Serialise.Serialise)
 
 initLogCollection :: Pipeline -> LogCollection
 initLogCollection pipeline =
@@ -198,3 +206,6 @@ runCollection docker collectUntil collection = do
                 }
         output <- docker.fetchLogs options
         pure [Log {step = step, output = output}]
+
+displayBuildNumber :: BuildNumber -> String
+displayBuildNumber number = "#" <> show (buildNumberToInt number)

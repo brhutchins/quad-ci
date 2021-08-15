@@ -10,7 +10,15 @@ import qualified System.Process.Typed as Process
 import qualified RIO.Set as Set
 import qualified RIO.ByteString as ByteString
 import qualified Docker
+import qualified Agent
+import qualified Server
+import qualified JobHandler
+import qualified JobHandler.Memory
+import qualified Control.Concurrent.Async as Async
 import qualified Data.Yaml as Yaml
+import qualified Data.Aeson as Aeson
+import qualified Network.HTTP.Simple as HTTP
+import qualified RIO.HashMap as HashMap
 
 -- Helper functions
 makeStep :: Text -> Text -> [Text] -> Step
@@ -29,7 +37,21 @@ emptyHooks :: Runner.Hooks
 emptyHooks =
   Runner.Hooks
     { logCollected = \_ -> pure ()
+    , buildUpdated = \_ -> pure ()
     }
+
+checkBuild :: JobHandler.Service -> BuildNumber -> IO ()
+checkBuild handler number = loop
+  where
+    loop = do
+      Just job <- handler.findJob number
+      case job.state of
+        JobHandler.JobScheduled build -> do
+          case build.state of
+            BuildFinished s -> s `shouldBe` BuildSucceeded
+            _ -> loop
+        _ -> loop
+
 -- First test
 
 testRunSuccess :: Runner.Service -> IO ()
@@ -75,7 +97,8 @@ testLogCollection runner = do
             (_, "") -> pure () -- Not found
             _ -> modifyMVar_ expected (pure . Set.delete word)
 
-  let hooks = Runner.Hooks { logCollected = onLog }
+  let hooks = Runner.Hooks { logCollected = onLog
+                           , buildUpdated = \_ -> pure () }
 
   build <- runner.prepareBuild $ makePipeline
             [ makeStep "Long step" "ubuntu" ["echo hello", "sleep 2", "echo world"]
@@ -105,12 +128,70 @@ testYamlDecoding runner = do
   result <- runner.runBuild emptyHooks build
   result.state `shouldBe` BuildFinished BuildSucceeded
 
+testServerAndAgent :: Runner.Service -> IO ()
+testServerAndAgent = do
+  runServerAndAgent $ \handler -> do
+    let pipeline =
+          makePipeline
+            [ makeStep "agent-test" "busybox" ["echo hello", "echo from agent"]
+            ]
+
+    let info =
+          JobHandler.CommitInfo
+            { sha = "00000"
+            , branch = "master"
+            , message = "test commit"
+            , author = "quad"
+            , repo = "quad-ci/quad"
+            }
+
+    number <- handler.queueJob info pipeline
+    checkBuild handler number
+
+runServerAndAgent :: (JobHandler.Service -> IO ()) -> Runner.Service -> IO ()
+runServerAndAgent callback runner = do
+  handler <- JobHandler.Memory.createService
+  serverThread <- Async.async do
+    Server.run (Server.Config 9000) handler
+
+  Async.link serverThread
+
+  agentThread <- Async.async do
+    Agent.run (Agent.Config "http://localhost:9000") runner
+
+  Async.link agentThread
+
+  callback handler
+
+  Async.cancel serverThread
+  Async.cancel agentThread
+
+testWebhookTrigger :: Runner.Service -> IO ()
+testWebhookTrigger =
+  runServerAndAgent $ \handler -> do
+    base <- HTTP.parseRequest "http://localhost:9000"
+
+    let req =
+          base
+            & HTTP.setRequestMethod "POST"
+            & HTTP.setRequestPath "/webhook/github"
+            & HTTP.setRequestBodyFile "test/github-payload.sample.json"
+
+    res <- HTTP.httpBS req
+
+    let Right (Aeson.Object build) = Aeson.eitherDecodeStrict $ HTTP.getResponseBody res
+    let Just (Aeson.Number number) = HashMap.lookup "number" build
+
+    checkBuild handler $ Core.BuildNumber (round number)
+
 main :: IO ()
 main = hspec do
   docker <- runIO Docker.createService
   runner <- runIO $ Runner.createService docker
 
   beforeAll cleanupDocker $ describe "Quad CI" do
+    it "should run server and agent" do
+      testServerAndAgent runner
     it "should decode pipelines" do
       testYamlDecoding runner
     it "should run a build (success)" do
@@ -123,6 +204,8 @@ main = hspec do
       testLogCollection runner
     it "should pull images" do
       testImagePull runner
+    it "should process webhooks" do
+      testWebhookTrigger runner
 
 cleanupDocker :: IO ()
 cleanupDocker = void do
